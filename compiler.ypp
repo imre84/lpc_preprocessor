@@ -1,0 +1,442 @@
+%{
+
+#include "compiler_internal.h"
+#include "preprocessor.h"
+//http://www.cs.man.ac.uk/~pjj/complang/grammar.html
+
+/*
+object dynamic loading:
+http://www.linux.org/docs/ldp/howto/Program-Library-HOWTO/dl-libraries.html
+http://www.isotton.com/devel/docs/C++-dlopen-mini-HOWTO/C++-dlopen-mini-HOWTO.html
+*/
+
+%}
+
+%token ARRAY_OPEN FUNC_OPEN FUNC_CLOSE MAPPING_OPEN
+//%token ARRAY_CLOSE MAPPING_CLOSE
+%token OPERATOR_LOG_OR OPERATOR_LOG_AND OPERATOR_EQ OPERATOR_NEQ
+%token OPERATOR_INCREMENT OPERATOR_DECREMENT OPERATOR_PLUSEQ
+%token OPERATOR_ARRAY OPERATOR_SHIFTL OPERATOR_SHIFTREQ OPERATOR_MODEQ OPERATOR_MULTEQ
+%token OPERATOR_DIVEQ OPERATOR_MINUSEQ OPERATOR_GE OPERATOR_INT_NEGATE OPERATOR_LE OPERATOR_SHIFTR OPERATOR_SHIFTLEQ
+%token OPERATOR_BIT_OREQ OPERATOR_BIT_XOREQ OPERATOR_BIT_ANDEQ
+%token OPERATOR_SCOPE
+%token CLASS NEW
+%token REF
+%token INHERIT
+%token STATIC PRIVATE PUBLIC NOMASK VARARGS
+%token VOID STRING MAPPING INT OBJECT MIXED FUNCTION ARRAY FLOAT BUFFER
+%token ID ANON_FUNCTIONAL_PARAM NAMED_ANON_FUNCTIONAL_PARAM
+%token STRCONST INTCONST CHARCONST FLOATCONST
+%token IF ELSE RETURN FOR FOREACH DO WHILE CONTINUE SWITCH CASE DEFAULT
+%token IN DOTDOT DOTDOTDOT
+%token EXPRESSION_COMES
+%token ERROR_SYMBOL
+
+//LPC precedence list (fuzzy for me):
+//http://mud.lysator.liu.se/www/books/nannymud_lpc/node4.html#SECTION000413000000000000000
+
+/*
+XXX fixme this precedence list is based on http://www.difranco.net/cop2220/op-prec.htm
+however the above document states that ?: precedes = += etc. it seems to me they are at the same precedence.
+let's consider x=y?7:z=9;
+if ?: precedes = then it would mean x=((y?7:z)=9); and that is nonsense
+if = precedes ?: then it would mean (x=y)?7:(z=9); this way the value 7 would be useless,
+and anyways is would be counter-intuitive
+so I define them to be on the same precedence level
+this way x=y?7:z=9; would mean x=(y?7:(z=9)); which is exactly the desired behaviour.
+*/
+
+%left  EXPRESSION_COMES
+%left  OPERATOR_SCOPE OPERATOR_ARRAY OPERATOR_POST_DEC OPERATOR_POST_INC
+%right OPERATOR_PRE_DEC OPERATOR_PRE_INC OPERATOR_INT_NEGATE '!' '~' OPERATOR_TYPECAST
+%left  '*' '/' '%'
+%left  '+' '-'
+%left  OPERATOR_SHIFTL OPERATOR_SHIFTR
+%left  '<' OPERATOR_LE '>' OPERATOR_GE
+%left  OPERATOR_EQ OPERATOR_NEQ
+%left  '&'
+%left  '^'
+%left  '|'
+%left  OPERATOR_LOG_AND
+%left  OPERATOR_LOG_OR
+%right '?' ':' '=' OPERATOR_PLUSEQ OPERATOR_MINUSEQ OPERATOR_MULTEQ OPERATOR_DIVEQ OPERATOR_MODEQ OPERATOR_BIT_ANDEQ OPERATOR_BIT_XOREQ OPERATOR_BIT_OREQ OPERATOR_SHIFTLEQ OPERATOR_SHIFTREQ
+%left  ','
+
+%start start
+
+%%
+
+start:
+       start mainpart|
+
+mainpart:
+       ';'|
+       inherit_directive|
+
+       //függvény definíció/deklaráció:
+       type_no_class             ID '(' formal_parameter_list ')' func_def_decl|
+                                 ID '(' formal_parameter_list ')' func_def_decl|
+       type_no_class star_array  ID '(' formal_parameter_list ')' func_def_decl|
+       labels_ne type_no_class   ID '(' formal_parameter_list ')' func_def_decl|
+       labels_ne type_no_class
+                     star_array  ID '(' formal_parameter_list ')' func_def_decl|
+
+       //változódefiníció:
+       type_no_class ID '=' single_expression ';'|
+       labels_ne type_no_class ID '=' single_expression ';'|
+       labels_ne type_no_class ID '=' single_expression ',' initializer_list ';'|
+       type_no_class star_array ID '=' single_expression ';'|
+       labels_ne type_no_class star_array ID '=' single_expression ';'|
+       type_no_class ID ';'|
+       labels_ne type_no_class ID ';'|
+       labels_ne type_no_class star_array ID ';'|
+       type_no_class star_array ID ';'|
+       type_no_class ID ',' initializer_list ';'|
+       labels_ne type_no_class ID ',' initializer_list ';'|
+       labels_ne type_no_class star_array ID ',' initializer_list ';'|
+       type_no_class star_array ID ',' initializer_list ';'|
+
+       //class kulcsszóval összefüggő variációk:
+
+       //osztálytípusdefiníció:
+       class_type '{' variable_declaration_list '}'|
+
+       //függvény definíció/deklaráció:
+       class_type                ID '(' formal_parameter_list ')' func_def_decl|
+       //                          ID '(' formal_parameter_list ')' func_def_decl| //as there's no typename in this rule, it is exactly the same as above.
+       class_type star_array     ID '(' formal_parameter_list ')' func_def_decl|
+       labels_ne class_type      ID '(' formal_parameter_list ')' func_def_decl|
+       labels_ne class_type
+                     star_array  ID '(' formal_parameter_list ')' func_def_decl|
+
+       //változódefiníció:
+       class_type ID '=' single_expression ';'|
+       labels_ne class_type ID '=' single_expression ';'|
+       labels_ne class_type ID '=' single_expression ',' initializer_list ';'|
+       class_type star_array ID '=' single_expression ';'|
+       labels_ne class_type star_array ID '=' single_expression ';'|
+       class_type ID ';'|
+       labels_ne class_type ID ';'|
+       labels_ne class_type star_array ID ';'|
+       class_type star_array ID ';'|
+       class_type ID ',' initializer_list ';'|
+       labels_ne class_type ID ',' initializer_list ';'|
+       labels_ne class_type star_array ID ',' initializer_list ';'|
+       class_type star_array ID ',' initializer_list ';'
+
+func_def_decl:
+       ';'|//declaration
+       '{' block_body '}' //definition
+
+inherit_directive:
+       INHERIT STRCONST ';'
+
+formal_parameter_list:
+       formal_parameter_list_ne optional_dotdotdot|
+
+optional_dotdotdot:
+       DOTDOTDOT|
+
+formal_parameter_list_ne:
+       formal_parameter_list_ne ',' formal_parameter|
+       formal_parameter
+
+formal_parameter:
+       type optional_array optional_ref optional_id
+
+optional_ref:
+       REF|
+
+optional_id:
+       ID|
+
+type:
+       scalartype|nonscalartype
+
+type_no_class:
+       scalartype_no_class|nonscalartype
+
+mapping_index_type:
+       STRING|
+       INT
+
+scalartype_no_class:
+       mapping_index_type|
+       MIXED|
+       OBJECT|
+       FLOAT|
+       MAPPING|
+       ARRAY
+
+scalartype:
+       scalartype_no_class|
+       class_type
+
+class_type:
+       CLASS ID
+
+nonscalartype:
+       VOID|
+       FUNCTION|
+       BUFFER
+
+labels_ne:
+       labels_ne label_ne|
+       label_ne
+
+label_ne:
+       VARARGS|
+       STATIC|
+       NOMASK|
+       PRIVATE|
+       PUBLIC
+
+variable_declaration:
+       variable_declaration_nosem ';'
+
+variable_declaration_nosem:
+       type initializer_list
+
+initializer_list:
+       initializer|
+       initializer_list ',' initializer
+
+initializer:
+       optional_array ID|
+       optional_array ID '=' single_expression
+
+star_array:
+       '*' |
+       ARRAY
+
+optional_array:
+       star_array|
+
+expression:
+       single_expression|
+       expression ',' single_expression
+
+single_expression:
+       EXPRESSION_COMES single_expression|
+       immediate_array|
+       immediate_mapping|
+       nsconstant|
+       qualified_id '=' single_expression|
+       functional|
+       //function_call| //function call is really a qualified id
+       qualified_id|
+       FUNCTION '(' formal_parameter_list ')' '{' block_body '}'|
+       //'(' expression ')'| //also a qualified id
+       single_expression '+' single_expression|
+       single_expression '-' single_expression|
+       '-' single_expression %prec OPERATOR_INT_NEGATE|
+       '~' single_expression|
+       single_expression '/' single_expression|
+       single_expression '%' single_expression|
+       single_expression '*' single_expression|
+       single_expression '&' single_expression|
+       single_expression '|' single_expression|
+       single_expression '^' single_expression|
+       single_expression OPERATOR_LOG_OR single_expression|
+       single_expression OPERATOR_LOG_AND single_expression|
+       single_expression OPERATOR_EQ single_expression|
+       single_expression OPERATOR_NEQ single_expression|
+       //single_expression '=' single_expression| //XXX fixme lvalue...? //XXX fixme is it really useful?
+       single_expression '<' single_expression|
+       single_expression '>' single_expression|
+       single_expression OPERATOR_LE single_expression|
+       single_expression OPERATOR_GE single_expression|
+       single_expression OPERATOR_INCREMENT %prec OPERATOR_POST_INC| //XXX fixme lvalue
+       single_expression OPERATOR_DECREMENT %prec OPERATOR_POST_DEC| //XXX fixme lvalue
+       OPERATOR_DECREMENT single_expression %prec OPERATOR_PRE_DEC| //XXX fixme lvalue
+       OPERATOR_INCREMENT single_expression %prec OPERATOR_PRE_INC| //XXX fixme lvalue
+       single_expression OPERATOR_PLUSEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_MINUSEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_MULTEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_DIVEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_MODEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_BIT_ANDEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_BIT_XOREQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_BIT_OREQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_SHIFTLEQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_SHIFTREQ single_expression| //XXX fixme lvalue
+       single_expression OPERATOR_SHIFTL single_expression|
+       single_expression OPERATOR_SHIFTR single_expression|
+       single_expression '?' expression ':' single_expression|
+       '!' single_expression|
+       single_expression '[' index ']'|
+       '(' type optional_array ')' single_expression %prec OPERATOR_TYPECAST
+       //|new_function_call //also a qualified id
+
+new_function_call:
+       NEW '(' class_type ')'|
+       NEW '(' actual_parameter_list ')'
+
+/*constant:
+       STRCONST|
+       nsconstant*/
+
+nsconstant:
+       INTCONST|
+       CHARCONST|
+       FLOATCONST
+
+immediate_array:
+       ARRAY_OPEN expression_list_ddd ARRAY_CLOSE
+
+expression_list_ddd:
+       expression_list_ddd_ne|
+
+expression_list_ddd_ne:
+       expression_list_ddd_ne_nc|
+       expression_list_ddd_ne_c
+
+expression_list_ddd_ne_nc:
+       expression_list_ddd_ne_c single_expression_ddd|
+       single_expression_ddd
+
+expression_list_ddd_ne_c:
+       expression_list_ddd_ne_nc ','
+
+single_expression_ddd:
+       single_expression optional_dotdotdot
+
+expression_list_ne:
+       expression_list_ne ',' single_expression|
+       single_expression
+
+immediate_mapping:
+       MAPPING_OPEN mapping_element_list MAPPING_CLOSE
+
+mapping_element_list:
+       mapping_element_list_ne optional_comma|
+
+mapping_element_list_ne:
+       mapping_element|
+       mapping_element_list_ne ',' mapping_element
+
+mapping_element:
+       mapping_element_left ':' single_expression
+
+mapping_element_left:
+       //immediate_array|constant|functional
+       expression
+
+optional_comma:
+       ','|
+
+function_call:
+       qualified_id '(' actual_parameter_list ')'|
+       '(' '*' ID ')' '(' actual_parameter_list ')'
+
+actual_parameter_list:
+       actual_parameter_list_ne_nc|
+       actual_parameter_list_ne_c|
+
+actual_parameter_list_ne_nc:
+       actual_parameter|
+       actual_parameter_list_ne_c actual_parameter
+
+actual_parameter_list_ne_c:
+       actual_parameter_list_ne_nc ','
+
+actual_parameter:
+       REF qualified_id|
+       single_expression optional_dotdotdot
+
+qualified_id:
+       leftmost_qualifier_id|
+       leftmost_qualifier_id OPERATOR_ARRAY sub_qualified_id|
+       sub_qualified_id
+
+leftmost_qualifier_id:
+       STRCONST|
+       ANON_FUNCTIONAL_PARAM|
+       NAMED_ANON_FUNCTIONAL_PARAM|
+       '(' expression ')'|
+       new_function_call
+
+sub_qualified_id:
+       sub_qualified_id OPERATOR_ARRAY inner_qualifier_id|
+       inner_qualifier_id
+
+inner_qualifier_id:
+       function_call|
+       ID|
+       OPERATOR_SCOPE ID|
+       ID OPERATOR_SCOPE ID|
+       OBJECT OPERATOR_SCOPE ID|
+       inner_qualifier_id '[' index ']'
+
+index:
+       '<' expression|
+       '<' expression DOTDOT|
+       expression|
+       expression DOTDOT expression|
+       expression DOTDOT|
+       expression DOTDOT '<' expression|
+       '<' expression DOTDOT '<' expression
+
+functional:
+       /* FUNC_OPEN ID FUNC_CLOSE| */
+       /*FUNC_OPEN ID '(' expression_list_ne ')' FUNC_CLOSE|*/
+       FUNC_OPEN expression_list_ne FUNC_CLOSE
+
+block_body:
+       variable_declaration_list command_list
+
+variable_declaration_list:
+       variable_declaration variable_declaration_list|
+
+command_list:
+       command_list_ne|
+
+command_list_ne:
+       command_list_ne command|
+       command
+
+command:
+       ';'|
+       expression ';' |
+       IF '(' expression ')' command else_branch|
+       '{' block_body '}'|
+       RETURN expression ';'|
+       RETURN ';'|
+       FOR '(' leftmost_for_part ';' expression ';' expression ')' command|
+       FOREACH '(' optional_scalartype ID IN expression ')' command|
+       FOREACH '(' optional_scalartype ID ',' optional_scalartype ID IN expression ')' command|
+       WHILE '(' expression ')' command|
+       CONTINUE ';'|
+       DO command WHILE '(' expression ')' ';'|
+       SWITCH '(' expression ')' '{' variable_declaration_list switch_case_list '}'
+
+leftmost_for_part:
+       expression|
+       variable_declaration_nosem|
+
+/*optional_mapping_index_type:
+       mapping_index_type|*/
+
+optional_scalartype:
+       scalartype optional_array|
+
+else_branch:
+       ELSE command| //XXX fixme else associativity?
+
+switch_case_list:
+       switch_case ':' command_list switch_case_list|
+       switch_optional_default
+
+switch_case:
+       CASE expression|
+       CASE INTCONST DOTDOT INTCONST
+
+switch_optional_default:
+       DEFAULT ':' command_list|
+
+//these char sequence sometimes means two lexical symbols:
+ARRAY_CLOSE:
+       '}' ')'
+
+MAPPING_CLOSE:
+       ']' ')'
