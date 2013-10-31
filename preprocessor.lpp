@@ -1,0 +1,372 @@
+%{
+
+//XXX fixme kódduplikálásokat megszüntetni
+//XXX fixme backupmentesíteni
+#include "preprocessor.h"
+#include "preproc_define.h"
+#include "preprocessor_expression_evaluation.h"
+#include "preproc_helpers.h"
+#include "comment_stripper.h"
+#include "compiler.h"
+#include <string>
+#include <iostream>
+
+using namespace std;
+
+#define TLSKIP(x) yytext[yyleng-=x]='\0'
+#define TLTRIM    while((yytext[yyleng-1]==' ')||(yytext[yyleng-1]=='\t')||(yytext[yyleng-1]=='\n')) TLSKIP(1)
+#define TFSKIP(x) yytext+x;
+
+int depth;
+
+string ifile,itext;int iline;
+
+#define HANDLE_WSDELIM if(yytext[yyleng-1]=='\n') NEXTLINE
+#define INTERNAL_ERROR {itext=yytext;ifile=__FILE__;iline=__LINE__;BEGIN(internalerror);}
+
+%}
+
+%x includestring includestring_ok includemacro recover_nl ml_comment pdef pdefc
+%x pdparlist pdefpc aplist aplist1 npid_preprocessing npid_compiling xid
+%x fbranch eat_nl compute_exp compute_fail xlineno includewrongdefine
+%x stringconstant after_stringconstant got_plus npid_after_stringconstant
+%x object_comes
+%x stringconstant_ml stringconstant_nl
+
+%x compiling preprocessing
+%x internalerror
+%option never-interactive
+
+/* Itt megadunk pár ismétlődő kifejezést: */
+PREPROC       ^[ \t]*#[ \t]*
+PPCOMMENT     \/\/.*
+/* comment közös rész: */
+COMMENTCOMMON ([^*\n]*\*+[^*\n/])*[^*\n]*
+/* comment belseje, egy sor szerkezete: */
+COMMENTLINE   {COMMENTCOMMON}\**\n
+/* comment utolsó sorában: */
+COMMENTEND    {COMMENTCOMMON}\*+\/
+ID            [_a-zA-Z][a-zA-Z_0-9]*
+/* a #define törzs lexer számára értelmetlen része (junk/garbage): */
+PDGA          ([^a-zA-Z_\\\n]*\\.)*[^a-zA-Z_\\\n]*
+WSDELIM       [ \t]+\n?|\n
+POSDNUM       [1-9][0-9]*
+/* DNUM          (-?{POSDNUM})|0 */
+DNUM          ({POSDNUM})|0
+HEXNUM        0[Xx][0-9a-fA-F]+
+FLOATNUM      {DNUM}\.[0-9]*
+PR_OP         [-()?:<>|^&+*/%!~]|\|\||&&|[!=<>]=|<<|>>
+AP_INSTRING   \"([^\\\"\n]*\\(.|\n))*[^\\\"\n]*
+AP            ([^\(\),\n\"]*{AP_INSTRING}\")*[^\(\),\n\"]*
+
+%%
+
+<preprocessing,compiling>{PPCOMMENT}                   //comment
+<preprocessing,compiling>\/\*{COMMENTEND}              /* egysorba írt percsillag comment */
+<preprocessing,compiling>\/\*                          BEGIN(ml_comment);skipping=true;
+
+<preprocessing,compiling>{PREPROC}line[ \t]+           BEGIN(xlineno);
+<preprocessing,compiling>{PREPROC}include[ \t]+        BEGIN(includemacro);parsing=p_include;
+<preprocessing,compiling>{PREPROC}include[ \t]+<.*>[ \t]*\n NEXTLINE;if((!other_include(yytext))&&compiling); //return(ERROR_SYMBOL); //XXX fixme uncommentme
+<preprocessing,compiling>{PREPROC}error[ \t].*         yyerror(yytext);if(!preprocess_only); //return(ERROR_SYMBOL);//XXX fixme uncommentme
+<preprocessing,compiling>{PREPROC}warning[ \t].*       yyerror(yytext,warning);
+<preprocessing,compiling>{PREPROC}define[ \t]+         BEGIN(pdef);
+<preprocessing,compiling>{PREPROC}undef[ \t]+{ID}[ \t]*\n undefine();NEXTLINE;
+<preprocessing,compiling>{PREPROC}ifdef[ \t]+          BEGIN(xid);parsing=p_ifdef;
+<preprocessing,compiling>{PREPROC}ifndef[ \t]+         BEGIN(xid);parsing=p_ifndef;
+<preprocessing,compiling>{PREPROC}else{WSDELIM}  {
+                                                  if(ifstack.empty())
+                                                    yyerror("#else without #if");
+                                                   else
+                                                    if(ifstack.top())
+                                                      yyerror("doubled #else");
+                                                     else
+                                                      {
+                                                       ifstack.top()=1;
+                                                       iffdepth=1;
+                                                       BEGIN(fbranch);
+                                                       //ifstack.pop();
+                                                       }
+                                                  HANDLE_WSDELIM;
+                                                 }
+
+<preprocessing,compiling>{PREPROC}endif{WSDELIM}       {
+                                                  if(ifstack.empty())
+                                                    yyerror("#endif without #if");
+                                                   else
+                                                    ifstack.pop();
+                                                  HANDLE_WSDELIM;
+                                                 }
+
+<preprocessing,compiling>{PREPROC}if[ \t]+             BEGIN(compute_exp);prep_eval::reset();
+
+<preprocessing,compiling>{PREPROC}.                    yyerror("preproc error invalid/malformed directive.");BEGIN(recover_nl);
+<preprocessing,compiling>{PREPROC}\n                   yyerror("preproc error invalid/malformed directive.");
+
+<xlineno>{DNUM}[ \t]*\n       curline=atoi(yytext);BEGIN(MYINITIAL);if(preprocess_only) fprintf(yyout,"\n#line %d\n",curline);
+<xlineno>{DNUM}[ \t]*\"       curline=atoi(yytext);BEGIN(includestring);parsing=p_line;
+<xlineno>.                    yyerror("malformed preproc directive");BEGIN(recover_nl);
+<xlineno>\n                   yyerror("malformed preproc directive");BEGIN(MYINITIAL);
+
+<includemacro>[ \t]*          /* ezt csak lenyeljük */
+<includemacro>\"              BEGIN(includestring);
+<includemacro>;?[ \t]*\n      if((!finish_include())&&compiling); //return(ERROR_SYMBOL); //XXX fixme uncommentme
+
+<includestring>[^\\\"\n]*     strconst+=yytext;
+<includestring>\\(.|\n)       strconst+=yytext[1];
+<includestring>\"             BEGIN(includemacro);
+<includestring><<EOF>>        yyerror("EOF in string constant.");BEGIN(MYINITIAL);
+<includestring>\"\n           finish_include();
+<includestring>\n             yyerror("String constant unterminated at EOL.");buffer("\"\n");
+<includestring>.              cerr<<"strconst="<<strconst<<endl;INTERNAL_ERROR;
+
+<includestring_ok>[ \t]*      ;/* ezeket csak lenyeljük */
+<includestring_ok>\"          BEGIN(includestring);
+<includestring_ok><<EOF>>     yyerror("no NL at end of file");finish_include();BEGIN(MYINITIAL);
+<includestring_ok>\n          finish_include();
+<includestring_ok>.           INTERNAL_ERROR;
+
+<recover_nl>.*                /* a hibát struccmódszerrel kiküszöböljük ki. */
+<recover_nl>\n                BEGIN(MYINITIAL);NEXTLINE;
+
+<ml_comment>{COMMENTLINE}     NEXTLINE; /* a commentet lenyeljük. */
+<ml_comment>{COMMENTEND}      BEGIN(MYINITIAL);skipping=false;report_file();
+<ml_comment><<EOF>>           yyerror("unterminated /* comment.");BEGIN(MYINITIAL);
+<ml_comment>.|\n              cerr<<"ERROR AT "<<__FILE__<<':'<<__LINE__<<endl;exit(1);
+
+<pdef>{ID}[ \t]*\n            TLTRIM;define_register_my_id(yytext);define_register_me();NEXTLINE;BEGIN(MYINITIAL); // binary definition
+<pdef>{ID}[ \t]               TLSKIP(1);define_register_my_id(yytext);BEGIN(pdefc);
+<pdef>{ID}\(                  TLSKIP(1);define_register_my_id(yytext);BEGIN(pdparlist);
+<pdef>{ID}.                   yyerror("malformed define");BEGIN(pdefc);
+
+<pdparlist>[ \t]*             /* whitespace-eket lenyeljük */
+<pdparlist>{ID},              TLSKIP(1);define_register_parameter(yytext);
+<pdparlist>{ID}\)             TLSKIP(1);define_register_parameter(yytext);BEGIN(pdefpc);
+<pdparlist>.                  yyerror("malformed define");define_invalidate();BEGIN(pdefc);
+
+<pdefc>([^\\\n]*\\.)*[^\\\n]*\\\n           TLSKIP(2);define_register_content_junk(yytext);NEXTLINE;
+<pdefc>[^\\\n]*(\\.[^\\\n]*)*\n             TLSKIP(1);BEGIN(MYINITIAL);NEXTLINE;define_register_content_junk(yytext);define_register_me();
+
+<pdefpc>{PDGA}                define_register_content_junk(yytext);
+<pdefpc>{PDGA}\\\n            TLSKIP(2);strconst+=yytext;NEXTLINE;
+<pdefpc>{PDGA}\n              {
+                               BEGIN(MYINITIAL);
+                               TLSKIP(1);
+                               define_register_content_junk(yytext);
+                               define_register_me();
+                               NEXTLINE;
+                              }
+
+<pdefpc>{ID}                  define_register_content_id(yytext);
+
+<aplist>\(                    BEGIN(aplist1);depth=0;
+<aplist>.                     BEGIN(err_id);buffer((define_id+yytext[0]).c_str());define_id="";
+ /* XXX fixme ^^^ this rule will break lexical terminals in two parts... */
+
+<aplist1>{AP}\(               ++depth;define_parlist+=yytext;strconst=strconst+yytext;
+<aplist1>{AP}\)               strconst=strconst+yytext; if(depth) { --depth; define_parlist+=yytext;} else{BEGIN(previous); yytext[yyleng-1]='\n';define_parlist+=yytext; buffer(preprocess_id(define_id.c_str(), define_parlist.c_str(), (define_id+'\050'+strconst).c_str()).c_str());strconst="";define_id="";define_parlist="";}
+<aplist1>{AP},                strconst=strconst+yytext;if(depth) define_parlist+=yytext;else{yytext[yyleng-1]='\n';define_parlist+=yytext;}
+<aplist1>{AP}\n               strconst=strconst+yytext;TLSKIP(1);define_parlist+=yytext;NEXTLINE;
+<aplist1>{AP}{AP_INSTRING}\n  strconst=strconst+yytext;yyerror("unterminated stringconstant");
+
+<xid>{ID}                     {
+                               bool d=defined(yytext);
+                               bool s=(parsing==p_ifdef);
+                               if((!(d&&s))&&(d||s))
+                                 skip_then_branch();
+                                else
+                                 take_then_branch();
+                              }
+<xid>.                        yyerror("malformed preproc directive");
+
+<eat_nl>{WSDELIM}             BEGIN(MYINITIAL);HANDLE_WSDELIM; else {yyerror("garbage at the end of directive");BEGIN(recover_nl);}
+<eat_nl>.                     yyerror("garbage at the end of directive");BEGIN(recover_nl);
+
+<fbranch>{PREPROC}if(n?def)?[ \t] ++iffdepth;
+<fbranch>{PREPROC}if(n?def)?.     ++iffdepth;yyerror("malformed preproc directive");
+<fbranch>{PREPROC}else{WSDELIM}   if(iffdepth==1) {if(!ifstack.top()){iffdepth=0;ifstack.top()=1;BEGIN(MYINITIAL);} else yyerror("doubled else 171");} HANDLE_WSDELIM;
+<fbranch>{PREPROC}elif[ \t]       if(iffdepth==1) {if(!ifstack.top()){iffdepth=0;ifstack.top()=1;BEGIN(MYINITIAL);buffer("#if ");}else yyerror("doubled else/elsif 139");}
+<fbranch>{PREPROC}endif{WSDELIM}  HANDLE_WSDELIM;--iffdepth;if(!iffdepth) BEGIN(MYINITIAL);
+<fbranch>\n                       NEXTLINE;
+<fbranch>.                        //akkor ezt lenyeljük.
+
+<compute_fail>{ID}            BEGIN(compute_exp);prep_eval::receive_int(0);
+ /* yyerror((string("unknown id: ")+yytext).c_str()); //fluffos doesn't even seem to warn about it... */
+
+<compute_exp>{ID}             handle_id(compute_fail);
+<compute_exp>{DNUM}           prep_eval::receive_int(atoi(yytext));
+<compute_exp>{PR_OP}          prep_eval::receive_op(yytext);
+<compute_exp>[ \t]+           //whitespace-eket lenyeljük.
+<compute_exp>\n               {
+                               bool l=prep_eval::is_valid();
+                               if((!l)||prep_eval::result())
+                                 {
+                                  if(!l) yyerror("expression evaluation error");
+                                  take_then_branch(MYINITIAL);
+                                 }
+                                else
+                                 skip_then_branch();
+                               NEXTLINE;
+                              }
+
+<internalerror>.*             {
+                               cerr<<"INTERNAL ERROR!!!!!!"<<endl;
+                               cerr<<ifile<<':'<<iline<<" raised an internal error."<<endl;
+                               yyerror("Internal error. Now the compiler(driver) gets halted.");
+                               yyerror("Actual error position is at the begginning of the following snippet:");
+                               cerr<<itext<<yytext<<endl;
+                               cerr<<"length="<<(yyleng+itext.length())<<endl;
+                               exit(1);
+                              }
+
+<includewrongdefine>{ID}      yyerror("Undefined macro in include"); BEGIN(recover_nl);
+
+<preprocessing>{ID}           handle_id(npid_preprocessing);
+<compiling>{ID}               handle_id(npid_compiling);
+<includemacro>{ID}            handle_id(includewrongdefine);
+
+<compiling,preprocessing>\"   BEGIN(stringconstant);if(preprocess_only) ECHO;
+<compiling,preprocessing>@{ID}\n {
+                                  NEXTLINE;
+                                  if(preprocess_only)
+                                    ECHO;
+                                   else
+                                    {
+                                     yytext++;
+                                     yytext[strlen(yytext)-1]='\0';//XXX fixme yylen?
+                                     define_id=yytext;
+                                     BEGIN(stringconstant_nl);
+                                    }
+                                 }
+
+<stringconstant>\n            strconst+=yytext[0];NEXTLINE;
+<stringconstant>[^\\\"\n]*    if(preprocess_only) ECHO; else strconst+=yytext;
+<stringconstant>\"            BEGIN(after_stringconstant);
+<stringconstant>\\.           {
+                               if(preprocess_only)
+                                 ECHO;
+                                else
+                                 strconst+=yytext[1];
+                              }
+
+<after_stringconstant>[ \t]*  /* lenyeljük */
+<after_stringconstant>\n      if(was_nl)NEXTLINE;was_nl=true;
+<after_stringconstant>\"      BEGIN(stringconstant);
+<after_stringconstant>\+      BEGIN(got_plus); //XXX fixme this one is a language aware preprocessor rule
+<after_stringconstant>{ID}    handle_id(npid_after_stringconstant);
+<after_stringconstant,npid_after_stringconstant>[^ \t\r\n\"] STRING_ENDS;
+<after_stringconstant,npid_after_stringconstant><<EOF>> STRING_ENDS;
+
+<got_plus>[ \t]*              /* ... */
+<got_plus>\"                  BEGIN(stringconstant);
+<got_plus>.                   unput(yytext[0]);unput('+');BEGIN(MYINITIAL);if(!preprocess_only) {strconst="";return STRCONST;}else{fprintf(yyout,"\"");}//XXX fixme értékvisszaadás, kódkettőzés,kétszeres unput...
+
+<stringconstant_nl>{ID}       {
+                               if(define_id==string(yytext))
+                                 {
+                                  BEGIN(MYINITIAL);
+                                  define_id="";
+                                  strconst="";
+                                  return STRCONST;//XXX fixme az értéket is visszaadni...
+                                 }
+                                else
+                                 {
+                                  strconst+=yytext;
+                                  BEGIN(stringconstant_ml);
+                                 }
+                              }
+
+<stringconstant_nl>.|\n       strconst+=yytext[0];if(yytext[0]=='\n') NEXTLINE; else BEGIN(stringconstant_ml);
+
+<stringconstant_ml>.*\n       strconst+=yytext;BEGIN(stringconstant_nl);NEXTLINE;
+
+ /* npid=Nem preprocesszor ID, épp nem direktívában vagyunk: */
+<npid_preprocessing>{ID}      BEGIN(previous);ECHO;
+
+<npid_compiling>void          BEGIN(previous);return(VOID);
+<npid_compiling>string        BEGIN(previous);return(STRING);
+<npid_compiling>int           BEGIN(previous);return(INT);
+<npid_compiling>object        BEGIN(previous);return(OBJECT);
+<npid_compiling>mixed         BEGIN(previous);return(MIXED);
+<npid_compiling>mapping       BEGIN(previous);return(MAPPING);
+<npid_compiling>float         BEGIN(previous);return(FLOAT);
+<npid_compiling>function      BEGIN(previous);return(FUNCTION);
+<npid_compiling>array         BEGIN(previous);return(ARRAY);
+<npid_compiling>buffer        BEGIN(previous);return(BUFFER);
+<npid_compiling>static        BEGIN(previous);return(STATIC);
+<npid_compiling>private       BEGIN(previous);return(PRIVATE);
+<npid_compiling>public        BEGIN(previous);return(PUBLIC);
+<npid_compiling>nomask        BEGIN(previous);return(NOMASK);
+<npid_compiling>varargs       BEGIN(previous);return(VARARGS);
+<npid_compiling>if            BEGIN(previous);return(IF);
+<npid_compiling>else          BEGIN(previous);return(ELSE);
+<npid_compiling>return        BEGIN(previous);return(RETURN);
+<npid_compiling>for           BEGIN(previous);return(FOR);
+<npid_compiling>foreach       BEGIN(previous);return(FOREACH);
+<npid_compiling>in            BEGIN(previous);return(IN);
+<npid_compiling>while         BEGIN(previous);return(WHILE);
+<npid_compiling>continue      BEGIN(previous);return(CONTINUE);
+<npid_compiling>switch        BEGIN(previous);return(SWITCH);
+<npid_compiling>case          BEGIN(previous);return(CASE);
+<npid_compiling>default       BEGIN(previous);return(DEFAULT);
+<npid_compiling>inherit       BEGIN(previous);return(INHERIT);
+<npid_compiling>class         BEGIN(previous);return(CLASS);
+<npid_compiling>ref           BEGIN(previous);return(REF);
+<npid_compiling>new           BEGIN(previous);return(NEW);
+<npid_compiling>do            BEGIN(previous);return(DO);
+<npid_compiling>object::      BEGIN(object_comes);yyless(0);return(EXPRESSION_COMES);//XXX fixme some workaround...
+<npid_compiling>{ID}          BEGIN(previous);return(ID);//XXX fixme really implement me...
+
+<object_comes>object          BEGIN(previous);return(OBJECT);
+
+<compiling>"||"               return OPERATOR_LOG_OR;
+<compiling>&&                 return OPERATOR_LOG_AND;
+<compiling>==                 return OPERATOR_EQ;
+<compiling>!=                 return OPERATOR_NEQ;
+<compiling>"++"               return OPERATOR_INCREMENT;
+<compiling>--                 return OPERATOR_DECREMENT;
+<compiling>\+=                return OPERATOR_PLUSEQ;
+<compiling>\*=                return OPERATOR_MULTEQ;
+<compiling>\/=                return OPERATOR_DIVEQ;
+<compiling>\|=                return OPERATOR_BIT_OREQ;
+<compiling>&=                return OPERATOR_DIVEQ;
+<compiling>-=                 return OPERATOR_MINUSEQ;
+<compiling>->                 return OPERATOR_ARRAY;
+<compiling>"<<"               return OPERATOR_SHIFTL;
+<compiling>">>"               return OPERATOR_SHIFTR;
+<compiling>"::"               return OPERATOR_SCOPE;
+<compiling>">="               return OPERATOR_GE;
+<compiling>"<="               return OPERATOR_LE;
+
+<compiling>[();,*={}!+![\]<>] return yytext[0];
+<compiling>[/%&|?:^]          return yytext[0];
+<compiling>[~]                return yytext[0];
+<compiling>-                  return yytext[0];
+<compiling>"({"               return ARRAY_OPEN;
+ /*<compiling>"})"               return ARRAY_CLOSE; //this char sequence can mean two lexical symbols also... */
+<compiling>"(:"               return FUNC_OPEN;
+<compiling>"(::"              unput(':');unput(':');return '(';//XXX fixme some workaround...
+<compiling>":)"               return FUNC_CLOSE;
+<compiling>"(["               return MAPPING_OPEN;
+ /*<compiling>"])"               return MAPPING_CLOSE; //this char sequence can mean two lexical symbols also... */
+<compiling>".."               return DOTDOT;
+<compiling>"..."              return DOTDOTDOT;
+
+<compiling>\'.\'              return CHARCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>\'\\.\'              return CHARCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>{DNUM}\.\.         yyless(yyleng-2);return INTCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>{DNUM}             return INTCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>{HEXNUM}           return INTCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>{FLOATNUM}         return FLOATCONST;//XXX fixme értéket is vissza kellene adni...
+<compiling>[$]{POSDNUM}       return ANON_FUNCTIONAL_PARAM;//XXX fixme hanyadik?
+<compiling>[$]\({ID}\)        return NAMED_ANON_FUNCTIONAL_PARAM;//XXX fixme nevét is visszaadni
+
+<*>\n                         NEXTLINE;if(preprocess_only) ECHO;
+<*>\r                         /* windows carriage return... yuck */
+
+<compiling>[ \t]+             /* lenyeljük */
+<compiling>.                  INTERNAL_ERROR;//just to be sure.
+
+%%
+
+#include "preproc_helpers_foot.h"
